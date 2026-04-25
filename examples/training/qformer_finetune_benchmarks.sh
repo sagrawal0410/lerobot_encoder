@@ -93,8 +93,9 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
-# Disable HF Hub push by default (same reason as Stage 1: a failing upload
-# would abort the whole benchmark sweep). Opt in with PUSH_TO_HUB=true.
+# Hub push at end-of-training. OFF by default — a failed push (missing/invalid
+# HF write token, repo doesn't exist, network blip, etc.) crashes the script
+# between sweep iterations. Set PUSH_TO_HUB=true to opt in.
 PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -334,16 +335,9 @@ for BENCHMARK in ${BENCHMARKS}; do
   echo "=== Benchmark: ${BENCHMARK} ===" | tee -a "${SUMMARY_LOG}"
   for N in ${N_VALUES}; do
     for SEED in ${SEEDS}; do
-      if ! finetune_one "${BENCHMARK}" "${N}" "${SEED}"; then
-        echo ">>> [WARNING] ${BENCHMARK}/qformer_n${N}_s${SEED} finetune FAILED — skipping its final eval and continuing" \
-          | tee -a "${SUMMARY_LOG}"
-        continue
-      fi
+      finetune_one "${BENCHMARK}" "${N}" "${SEED}"
       if [[ "${RUN_FINAL_EVAL}" == "true" ]]; then
-        if ! final_eval_one "${BENCHMARK}" "${N}" "${SEED}"; then
-          echo ">>> [WARNING] ${BENCHMARK}/qformer_n${N}_s${SEED} final eval FAILED — continuing" \
-            | tee -a "${SUMMARY_LOG}"
-        fi
+        final_eval_one "${BENCHMARK}" "${N}" "${SEED}"
       fi
     done
   done
