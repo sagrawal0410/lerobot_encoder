@@ -131,6 +131,10 @@ ROBOTWIN_EVAL_N_EPISODES_TRAIN="${ROBOTWIN_EVAL_N_EPISODES_TRAIN:-${EVAL_N_EPISO
 # Frame-timestamp tolerance — same reasoning as Stage 1 (aggregator drift).
 TOLERANCE_S="${TOLERANCE_S:-0.001}"
 
+# Video decoder backend — see qformer_pretrain_custom.sh for the explanation.
+# Default 'pyav' avoids the torchcodec/libstdc++ dance on stock Runpod images.
+VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
+
 # Optional camera rename map. Stage-1 → Stage-2 normally needs no rename
 # because both LIBERO/MetaWorld/RoboTwin and the Stage-1 saved policy use
 # ``observation.images.camera{1,2,3}``. Override per-benchmark via
@@ -286,6 +290,9 @@ finetune_one() {
     --tolerance_s="${TOLERANCE_S}"
     --wandb.project="${wandb_project}"
   )
+  if [[ -n "${VIDEO_BACKEND}" ]]; then
+    args+=(--dataset.video_backend="${VIDEO_BACKEND}")
+  fi
   if [[ -n "${BENCH_RENAME_MAP}" && "${BENCH_RENAME_MAP}" != "{}" ]]; then
     args+=(--rename_map="${BENCH_RENAME_MAP}")
   fi
