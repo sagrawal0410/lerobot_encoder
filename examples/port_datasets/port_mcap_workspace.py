@@ -25,8 +25,21 @@ Expected source layout:
       <task_b>/
         ...
 
-Each ``output.mcap`` is treated as one episode. One ``LeRobotDataset`` is
-produced per task directory at ``<dst>/<task>/{meta,data,videos}/...``.
+Two output modes (``--mode``):
+
+* **merged** (default, recommended for SmolVLA-style base pretraining)
+
+  Produces ONE LeRobot dataset under ``<dst>/<merged-name>/`` containing every
+  ``output.mcap`` from every ``<task>/`` as one episode. Each episode keeps its
+  own ``task`` string from ``/instruction`` (fallback = task dir name), so the
+  resulting ``meta/tasks.parquet`` mirrors how ``lerobot/smolvla_base`` itself
+  was trained: a flat pool of language-tagged episodes.
+
+* **per-task**
+
+  Produces ONE LeRobot dataset per task directory under ``<dst>/<task>/``.
+  Use this when you want to train per-task expert policies, OR when you want
+  the option to merge later via ``aggregate_per_task_datasets.py``.
 
 Topics consumed (foxglove protobuf):
 
@@ -42,43 +55,36 @@ Topics consumed (foxglove protobuf):
 Master clock = top camera timestamps (≈30 Hz). State / action are picked by
 nearest-timestamp lookup.
 
-Usage (basic):
+Usage (default — single merged dataset, SmolVLA-style):
 
     python examples/port_datasets/port_mcap_workspace.py \\
         --src /workspace \\
         --dst /workspace/lerobot \\
         --hf-user sagrawal0410 \\
         --image-size 512
+    # → /workspace/lerobot/_combined/{meta,data,videos}/...
 
-Usage (fast — multiple tasks in parallel, GPU decode if available):
+Usage (per-task experts, multiple tasks in parallel):
+
+    python examples/port_datasets/port_mcap_workspace.py \\
+        --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
+        --mode per-task --num-workers 4
+
+Usage (fast — GPU decode + GPU encode where available):
 
     python examples/port_datasets/port_mcap_workspace.py \\
         --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
         --image-size 512 \\
         --vcodec h264_nvenc \\
         --hwaccel cuda \\
-        --num-workers 4 \\
-        --num-workers 4 \\
         --image-writer-threads 8
 
-Usage (zero-resize — store native resolution videos, fastest for CPU):
-
-    python examples/port_datasets/port_mcap_workspace.py \\
-        --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
-        --image-size 0 --vcodec h264 --num-workers $(nproc)
-
-Usage (zero-resize — store native resolution videos, fastest for CPU):
-
-    python examples/port_datasets/port_mcap_workspace.py \\
-        --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
-        --image-size 0 --vcodec h264 --num-workers $(nproc)
-
-Speed knobs (in rough order of impact on a typical CPU pod):
+Speed knobs (rough order of impact on a typical CPU pod):
     --vcodec h264                       (~10× faster than libsvtav1; default)
     --vcodec h264_nvenc                 (GPU encode; needs FFmpeg w/ NVENC)
     --hwaccel cuda                      (GPU HEVC decode via NVDEC)
-    --num-workers N                     (process-parallelism over tasks)
-    --image-writer-threads K            (threads inside each task)
+    --num-workers N                     (per-task mode only — parallel tasks)
+    --image-writer-threads K            (threads inside the writer)
     --image-size 0                      (skip per-frame resize)
 
 Dependencies (one-off):
@@ -434,6 +440,58 @@ def detect_native_size(mcap_path: Path, hwaccel: str | None = None) -> tuple[int
     return int(h), int(w)
 
 
+def _open_dataset(
+    out_root: Path,
+    repo_id: str,
+    fps: int,
+    stored_hw: tuple[int, int],
+    vcodec: str,
+    streaming_encoding: bool,
+    image_writer_threads: int,
+    image_writer_processes: int,
+) -> LeRobotDataset:
+    out_root.parent.mkdir(parents=True, exist_ok=True)
+    return LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=fps,
+        features=features_dict(stored_hw),
+        root=out_root,
+        robot_type="bimanual_robot",
+        use_videos=True,
+        vcodec=vcodec,
+        streaming_encoding=streaming_encoding,
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=image_writer_processes,
+    )
+
+
+def _convert_one_episode_into(
+    mcap_path: Path,
+    dataset: LeRobotDataset,
+    convert_image_size: tuple[int, int] | None,
+    fallback_task: str,
+    hwaccel: str | None,
+    label: str,
+) -> int:
+    """Wrap ``convert_episode`` with logging + buffer cleanup. Returns frames written."""
+    try:
+        n = convert_episode(
+            mcap_path=mcap_path,
+            dataset=dataset,
+            image_size=convert_image_size,
+            fallback_task=fallback_task,
+            hwaccel=hwaccel,
+        )
+        logger.info("  %s %s → %d frames", label, mcap_path.parent.name, n)
+        return n
+    except Exception as e:  # noqa: BLE001
+        logger.error("  %s %s FAILED: %s", label, mcap_path, e)
+        logger.debug("%s", traceback.format_exc())
+        if dataset.has_pending_frames():
+            dataset.clear_episode_buffer()
+        return 0
+
+
 def convert_task(
     task_dir: Path,
     dst_root: Path,
@@ -449,8 +507,7 @@ def convert_task(
     parallel_episode_encoding: bool = True,
     log_level: str = "INFO",
 ) -> tuple[str, int, int]:
-    """Convert one task. Returns (task_name, episodes_ok, episodes_total)."""
-    # When invoked from a worker process the parent's logging config is lost.
+    """Convert one task into ``<dst_root>/<task>/``. Returns (task_name, ok, total)."""
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=getattr(logging, log_level.upper()),
@@ -468,61 +525,140 @@ def convert_task(
         logger.warning("[skip] %s — no */output.mcap found", task_name)
         return task_name, 0, 0
 
-    # Decide stored image size: explicit (h, w) or native (peek at first MCAP).
+    stored_hw = (
+        image_size if image_size is not None else detect_native_size(mcaps[0], hwaccel=hwaccel)
+    )
     if image_size is None:
-        stored_hw = detect_native_size(mcaps[0], hwaccel=hwaccel)
         logger.info("[task=%s] using native image size %s", task_name, stored_hw)
-    else:
-        stored_hw = image_size
 
     logger.info("[task=%s] %d episodes → %s (vcodec=%s, streaming=%s, hwaccel=%s)",
                 task_name, len(mcaps), out_root, vcodec, streaming_encoding, hwaccel)
-    out_root.parent.mkdir(parents=True, exist_ok=True)
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=fps,
-        features=features_dict(stored_hw),
-        root=out_root,
-        robot_type="bimanual_robot",
-        use_videos=True,
-        vcodec=vcodec,
-        streaming_encoding=streaming_encoding,
+    dataset = _open_dataset(
+        out_root=out_root, repo_id=repo_id, fps=fps, stored_hw=stored_hw,
+        vcodec=vcodec, streaming_encoding=streaming_encoding,
         image_writer_threads=image_writer_threads,
         image_writer_processes=image_writer_processes,
     )
-
-    # When ``add_frame`` resizes, ``image_size`` for ``convert_episode`` matches
-    # the dataset's stored size; when keeping native, pass None to skip resize.
     convert_image_size = stored_hw if image_size is not None else None
 
     n_ok = 0
     try:
         for k, mcap in enumerate(mcaps):
-            try:
-                n = convert_episode(
-                    mcap_path=mcap,
-                    dataset=dataset,
-                    image_size=convert_image_size,
-                    fallback_task=task_name.replace("_", " "),
-                    hwaccel=hwaccel,
-                )
-                logger.info("  [%d/%d] %s → %d frames", k + 1, len(mcaps), mcap.parent.name, n)
-                if n > 0:
-                    n_ok += 1
-            except Exception as e:  # noqa: BLE001
-                logger.error("  [%d/%d] %s FAILED: %s", k + 1, len(mcaps), mcap, e)
-                logger.debug("%s", traceback.format_exc())
-                if dataset.has_pending_frames():
-                    dataset.clear_episode_buffer()
+            label = f"[{k + 1}/{len(mcaps)}]"
+            if _convert_one_episode_into(
+                mcap_path=mcap,
+                dataset=dataset,
+                convert_image_size=convert_image_size,
+                fallback_task=task_name.replace("_", " "),
+                hwaccel=hwaccel,
+                label=label,
+            ) > 0:
+                n_ok += 1
     finally:
-        # ``parallel_encoding=False`` for save_episode is implied by streaming.
-        # The dataset's ``finalize`` flushes everything regardless.
-        _ = parallel_episode_encoding  # currently unused; reserved for future.
+        _ = parallel_episode_encoding  # reserved for future
         dataset.finalize()
 
     logger.info("[task=%s] done — %d/%d episodes converted", task_name, n_ok, len(mcaps))
     return task_name, n_ok, len(mcaps)
+
+
+def convert_merged(
+    task_dirs: list[Path],
+    dst_root: Path,
+    merged_name: str,
+    repo_id: str,
+    fps: int,
+    image_size: tuple[int, int] | None,
+    vcodec: str,
+    skip_existing: bool,
+    streaming_encoding: bool = True,
+    image_writer_threads: int = 4,
+    image_writer_processes: int = 0,
+    hwaccel: str | None = None,
+    log_level: str = "INFO",
+) -> tuple[str, int, int]:
+    """Convert ALL tasks into ONE LeRobot dataset under ``<dst_root>/<merged_name>/``.
+
+    Each ``output.mcap`` becomes one episode whose ``task`` field is read from
+    ``/instruction`` (fallback: parent directory name). This mirrors the data
+    layout used to train ``lerobot/smolvla_base``: a single language-tagged
+    episode pool sampled uniformly during training.
+    """
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        )
+
+    out_root = dst_root / merged_name
+    if skip_existing and (out_root / "meta" / "info.json").exists():
+        logger.info("[skip-merged] %s already exists at %s", merged_name, out_root)
+        return merged_name, 0, 0
+
+    jobs: list[tuple[str, Path]] = []
+    per_task_count: dict[str, int] = {}
+    for td in task_dirs:
+        if not td.is_dir():
+            continue
+        mcaps = sorted(td.glob("*/output.mcap"))
+        if not mcaps:
+            logger.warning("[skip-task] %s — no */output.mcap found", td.name)
+            continue
+        per_task_count[td.name] = len(mcaps)
+        for m in mcaps:
+            jobs.append((td.name, m))
+
+    if not jobs:
+        logger.error("No MCAPs found under any task dir; nothing to do.")
+        return merged_name, 0, 0
+
+    stored_hw = (
+        image_size if image_size is not None
+        else detect_native_size(jobs[0][1], hwaccel=hwaccel)
+    )
+    if image_size is None:
+        logger.info("[merged] using native image size %s", stored_hw)
+
+    total = len(jobs)
+    logger.info(
+        "[merged=%s] %d tasks, %d episodes total → %s "
+        "(vcodec=%s, streaming=%s, hwaccel=%s)",
+        merged_name, len(per_task_count), total, out_root,
+        vcodec, streaming_encoding, hwaccel,
+    )
+    for tname, n in per_task_count.items():
+        logger.info("  · %-50s  %4d episodes", tname, n)
+
+    dataset = _open_dataset(
+        out_root=out_root, repo_id=repo_id, fps=fps, stored_hw=stored_hw,
+        vcodec=vcodec, streaming_encoding=streaming_encoding,
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=image_writer_processes,
+    )
+    convert_image_size = stored_hw if image_size is not None else None
+
+    n_ok = 0
+    try:
+        for k, (task_name, mcap) in enumerate(jobs):
+            label = f"[{k + 1}/{total} task={task_name}]"
+            if _convert_one_episode_into(
+                mcap_path=mcap,
+                dataset=dataset,
+                convert_image_size=convert_image_size,
+                fallback_task=task_name.replace("_", " "),
+                hwaccel=hwaccel,
+                label=label,
+            ) > 0:
+                n_ok += 1
+    finally:
+        dataset.finalize()
+
+    logger.info(
+        "[merged=%s] done — %d/%d episodes converted across %d tasks",
+        merged_name, n_ok, total, len(per_task_count),
+    )
+    return merged_name, n_ok, total
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -531,9 +667,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--src", type=Path, default=Path("/workspace"),
                    help="Root of MCAP workspace (default: /workspace).")
     p.add_argument("--dst", type=Path, default=Path("/workspace/lerobot"),
-                   help="Output root, one subdir per task (default: /workspace/lerobot).")
+                   help="Output root (default: /workspace/lerobot).")
     p.add_argument("--hf-user", required=True,
-                   help="HF Hub username — used to namespace each task's repo_id (no upload happens here).")
+                   help="HF Hub username — used to namespace dataset repo_id(s) (no upload happens here).")
+    p.add_argument(
+        "--mode", choices=["merged", "per-task"], default="merged",
+        help=(
+            "Output layout. 'merged' (default) writes ONE LeRobot dataset under "
+            "<dst>/<merged-name>/ containing every MCAP as an episode, each tagged "
+            "with its task — this matches the SmolVLA base training data layout. "
+            "'per-task' writes one dataset per task subdir under <dst>/<task>/."
+        ),
+    )
+    p.add_argument(
+        "--merged-name", default="_combined",
+        help="In merged mode, name of the single output subdir under <dst>. Default: _combined.",
+    )
     p.add_argument("--fps", type=int, default=30, help="Master FPS (camera rate). Default: 30.")
     p.add_argument("--image-size", type=int, default=512,
                    help="Square resize for stored video frames. Use 0 to keep native resolution. Default: 512.")
@@ -550,7 +699,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--num-workers", type=int, default=1,
-        help="Number of tasks to convert in parallel (each as a separate process). Default: 1.",
+        help=(
+            "Per-task mode only: number of tasks to convert in parallel "
+            "(each as a separate process). Ignored in merged mode (single writer). "
+            "Default: 1."
+        ),
     )
     p.add_argument(
         "--no-streaming-encoding", action="store_true",
@@ -587,10 +740,14 @@ def main() -> int:
     if args.tasks:
         task_dirs = [src / t for t in args.tasks]
     else:
+        dst_resolved = args.dst.resolve()
         task_dirs = sorted(
             d for d in src.iterdir()
-            if d.is_dir() and d.resolve() != args.dst.resolve()
-            and not d.name.startswith(".") and d.name != "lerobot"
+            if d.is_dir()
+            and d.resolve() != dst_resolved
+            and not d.name.startswith(".")
+            and d.name != "lerobot"
+            and d.name != args.merged_name
         )
 
     if not task_dirs:
@@ -601,13 +758,45 @@ def main() -> int:
         None if args.image_size == 0 else (args.image_size, args.image_size)
     )
 
+    streaming_encoding = not args.no_streaming_encoding
+
+    if args.mode == "merged":
+        if args.num_workers > 1:
+            logger.warning(
+                "--num-workers=%d ignored in merged mode (one writer only); "
+                "in-episode threading still applies.", args.num_workers,
+            )
+        repo_id = f"{args.hf_user}/{args.merged_name}"
+        try:
+            convert_merged(
+                task_dirs=task_dirs,
+                dst_root=args.dst,
+                merged_name=args.merged_name,
+                repo_id=repo_id,
+                fps=args.fps,
+                image_size=image_size,
+                vcodec=args.vcodec,
+                skip_existing=args.skip_existing,
+                streaming_encoding=streaming_encoding,
+                image_writer_threads=args.image_writer_threads,
+                image_writer_processes=args.image_writer_processes,
+                hwaccel=args.hwaccel,
+                log_level=args.log_level,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("[merged] FAILED: %s", e)
+            logger.debug("%s", traceback.format_exc())
+        logger.info("All done. Merged dataset root: %s", args.dst / args.merged_name)
+        return 0
+
+    # ── per-task mode ──
     common_kwargs = dict(
         dst_root=args.dst,
         fps=args.fps,
         image_size=image_size,
         vcodec=args.vcodec,
         skip_existing=args.skip_existing,
-        streaming_encoding=not args.no_streaming_encoding,
+        streaming_encoding=streaming_encoding,
         image_writer_threads=args.image_writer_threads,
         image_writer_processes=args.image_writer_processes,
         hwaccel=args.hwaccel,
@@ -633,7 +822,6 @@ def main() -> int:
                 logger.debug("%s", traceback.format_exc())
     else:
         ctx = mp.get_context("spawn")
-        # Wrap convert_task as a top-level partial so it pickles for spawn.
         worker = partial(_convert_task_entrypoint, common_kwargs=common_kwargs)
         with ctx.Pool(processes=args.num_workers) as pool:
             for res in pool.imap_unordered(worker, jobs):
@@ -643,7 +831,7 @@ def main() -> int:
                 else:
                     logger.error("worker returned unexpected: %r", res)
 
-    logger.info("All done. Output root: %s", args.dst)
+    logger.info("All done. Per-task output root: %s", args.dst)
     return 0
 
 
