@@ -93,6 +93,49 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-benchmark step / batch / eval overrides.
+#
+# By default each benchmark inherits ``STEPS``, ``BATCH_SIZE``, ``EVAL_FREQ``,
+# ``EVAL_N_EPISODES_TRAIN`` from the top-level vars above. Override per
+# benchmark with ``LIBERO_STEPS``, ``METAWORLD_BATCH_SIZE``, etc. to match a
+# specific published recipe. Examples (matching LeRobot docs as of 2026):
+#
+#   # SmolVLA general user-finetune recipe (smolvla.mdx)
+#   STEPS=20000 BATCH_SIZE=64
+#
+#   # LIBERO doc example (libero.mdx, 1-GPU illustration)
+#   LIBERO_STEPS=100000 LIBERO_BATCH_SIZE=4 LIBERO_EVAL_FREQ=1000
+#
+#   # MetaWorld doc example (metaworld.mdx, 1-GPU illustration)
+#   METAWORLD_STEPS=100000 METAWORLD_BATCH_SIZE=4 METAWORLD_EVAL_FREQ=1000
+# ──────────────────────────────────────────────────────────────────────────────
+LIBERO_STEPS="${LIBERO_STEPS:-${STEPS}}"
+METAWORLD_STEPS="${METAWORLD_STEPS:-${STEPS}}"
+ROBOTWIN_STEPS="${ROBOTWIN_STEPS:-${STEPS}}"
+LIBERO_BATCH_SIZE="${LIBERO_BATCH_SIZE:-${BATCH_SIZE}}"
+METAWORLD_BATCH_SIZE="${METAWORLD_BATCH_SIZE:-${BATCH_SIZE}}"
+ROBOTWIN_BATCH_SIZE="${ROBOTWIN_BATCH_SIZE:-${BATCH_SIZE}}"
+LIBERO_EVAL_FREQ="${LIBERO_EVAL_FREQ:-${EVAL_FREQ}}"
+METAWORLD_EVAL_FREQ="${METAWORLD_EVAL_FREQ:-${EVAL_FREQ}}"
+ROBOTWIN_EVAL_FREQ="${ROBOTWIN_EVAL_FREQ:-${EVAL_FREQ}}"
+LIBERO_EVAL_N_EPISODES_TRAIN="${LIBERO_EVAL_N_EPISODES_TRAIN:-${EVAL_N_EPISODES_TRAIN}}"
+METAWORLD_EVAL_N_EPISODES_TRAIN="${METAWORLD_EVAL_N_EPISODES_TRAIN:-${EVAL_N_EPISODES_TRAIN}}"
+ROBOTWIN_EVAL_N_EPISODES_TRAIN="${ROBOTWIN_EVAL_N_EPISODES_TRAIN:-${EVAL_N_EPISODES_TRAIN}}"
+
+# Frame-timestamp tolerance — same reasoning as Stage 1 (aggregator drift).
+TOLERANCE_S="${TOLERANCE_S:-0.001}"
+
+# Optional camera rename map. Stage-1 → Stage-2 normally needs no rename
+# because both LIBERO/MetaWorld/RoboTwin and the Stage-1 saved policy use
+# ``observation.images.camera{1,2,3}``. Override per-benchmark via
+# ``LIBERO_RENAME_MAP``, ``METAWORLD_RENAME_MAP``, ``ROBOTWIN_RENAME_MAP`` if
+# the benchmark dataset uses different camera keys.
+RENAME_MAP="${RENAME_MAP:-}"
+LIBERO_RENAME_MAP="${LIBERO_RENAME_MAP:-${RENAME_MAP}}"
+METAWORLD_RENAME_MAP="${METAWORLD_RENAME_MAP:-${RENAME_MAP}}"
+ROBOTWIN_RENAME_MAP="${ROBOTWIN_RENAME_MAP:-${RENAME_MAP}}"
+
 LIBERO_DATASET="${LIBERO_DATASET:-HuggingFaceVLA/libero}"
 METAWORLD_DATASET="${METAWORLD_DATASET:-lerobot/metaworld_mt50}"
 ROBOTWIN_DATASET="${ROBOTWIN_DATASET:-lerobot/robotwin_unified}"
@@ -156,14 +199,29 @@ resolve_benchmark_config() {
     libero)
       BENCH_DATASET="${LIBERO_DATASET}"
       BENCH_EVAL_TASKS="${LIBERO_EVAL_TASKS}"
+      BENCH_RENAME_MAP="${LIBERO_RENAME_MAP}"
+      BENCH_STEPS="${LIBERO_STEPS}"
+      BENCH_BATCH_SIZE="${LIBERO_BATCH_SIZE}"
+      BENCH_EVAL_FREQ="${LIBERO_EVAL_FREQ}"
+      BENCH_EVAL_N_EPISODES_TRAIN="${LIBERO_EVAL_N_EPISODES_TRAIN}"
       ;;
     metaworld)
       BENCH_DATASET="${METAWORLD_DATASET}"
       BENCH_EVAL_TASKS="${METAWORLD_EVAL_TASKS}"
+      BENCH_RENAME_MAP="${METAWORLD_RENAME_MAP}"
+      BENCH_STEPS="${METAWORLD_STEPS}"
+      BENCH_BATCH_SIZE="${METAWORLD_BATCH_SIZE}"
+      BENCH_EVAL_FREQ="${METAWORLD_EVAL_FREQ}"
+      BENCH_EVAL_N_EPISODES_TRAIN="${METAWORLD_EVAL_N_EPISODES_TRAIN}"
       ;;
     robotwin)
       BENCH_DATASET="${ROBOTWIN_DATASET}"
       BENCH_EVAL_TASKS="${ROBOTWIN_EVAL_TASKS}"
+      BENCH_RENAME_MAP="${ROBOTWIN_RENAME_MAP}"
+      BENCH_STEPS="${ROBOTWIN_STEPS}"
+      BENCH_BATCH_SIZE="${ROBOTWIN_BATCH_SIZE}"
+      BENCH_EVAL_FREQ="${ROBOTWIN_EVAL_FREQ}"
+      BENCH_EVAL_N_EPISODES_TRAIN="${ROBOTWIN_EVAL_N_EPISODES_TRAIN}"
       ;;
     *)
       echo "ERROR: unknown benchmark '${bench}'" | tee -a "${SUMMARY_LOG}"
@@ -189,6 +247,13 @@ finetune_one() {
     return 0
   fi
 
+  # Auto-clean partial output dirs (existing dir with no checkpoints) so a
+  # previous crashed attempt doesn't trip lerobot-train's existence check.
+  if [[ -d "${output_dir}" && ! -d "${output_dir}/checkpoints" ]]; then
+    echo ">>> [clean-partial] ${run_name}: removing partial ${output_dir}" | tee -a "${SUMMARY_LOG}"
+    rm -rf "${output_dir}"
+  fi
+
   echo ">>> [stage2-finetune] ${run_name}  (start=${starting_ckpt})" | tee -a "${SUMMARY_LOG}"
   local args=(
     --policy.path="${starting_ckpt}"
@@ -202,18 +267,22 @@ finetune_one() {
     --dataset.repo_id="${BENCH_DATASET}"
     --env.type="${bench}"
     --env.task="${BENCH_EVAL_TASKS}"
-    --steps="${STEPS}"
-    --batch_size="${BATCH_SIZE}"
+    --steps="${BENCH_STEPS}"
+    --batch_size="${BENCH_BATCH_SIZE}"
     --seed="${seed}"
-    --eval_freq="${EVAL_FREQ}"
-    --eval.n_episodes="${EVAL_N_EPISODES_TRAIN}"
+    --eval_freq="${BENCH_EVAL_FREQ}"
+    --eval.n_episodes="${BENCH_EVAL_N_EPISODES_TRAIN}"
     --eval.batch_size=1
     --save_freq="${SAVE_FREQ}"
     --output_dir="${output_dir}"
     --job_name="${run_name}"
     --wandb.enable="${WANDB_ENABLE}"
+    --tolerance_s="${TOLERANCE_S}"
     --wandb.project="${wandb_project}"
   )
+  if [[ -n "${BENCH_RENAME_MAP}" && "${BENCH_RENAME_MAP}" != "{}" ]]; then
+    args+=(--rename_map="${BENCH_RENAME_MAP}")
+  fi
   if [[ "${USE_PEFT}" == "true" ]]; then
     args+=(--peft.method_type=LORA --peft.r="${PEFT_R}")
   fi
