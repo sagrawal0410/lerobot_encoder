@@ -42,13 +42,37 @@ Topics consumed (foxglove protobuf):
 Master clock = top camera timestamps (≈30 Hz). State / action are picked by
 nearest-timestamp lookup.
 
-Usage:
+Usage (basic):
 
     python examples/port_datasets/port_mcap_workspace.py \\
         --src /workspace \\
         --dst /workspace/lerobot \\
         --hf-user sagrawal0410 \\
         --image-size 512
+
+Usage (fast — multiple tasks in parallel, GPU decode if available):
+
+    python examples/port_datasets/port_mcap_workspace.py \\
+        --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
+        --image-size 512 \\
+        --vcodec h264_nvenc \\
+        --hwaccel cuda \\
+        --num-workers 4 \\
+        --image-writer-threads 8
+
+Usage (zero-resize — store native resolution videos, fastest for CPU):
+
+    python examples/port_datasets/port_mcap_workspace.py \\
+        --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
+        --image-size 0 --vcodec h264 --num-workers $(nproc)
+
+Speed knobs (in rough order of impact on a typical CPU pod):
+    --vcodec h264                       (~10× faster than libsvtav1; default)
+    --vcodec h264_nvenc                 (GPU encode; needs FFmpeg w/ NVENC)
+    --hwaccel cuda                      (GPU HEVC decode via NVDEC)
+    --num-workers N                     (process-parallelism over tasks)
+    --image-writer-threads K            (threads inside each task)
+    --image-size 0                      (skip per-frame resize)
 
 Dependencies (one-off):
 
@@ -59,9 +83,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing as mp
+import os
 import sys
 import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import av
@@ -157,17 +185,52 @@ def read_mcap(mcap_path: Path) -> dict[str, list[tuple[int, object]]]:
     return out
 
 
-def decode_h265_frames(chunks: list[tuple[int, bytes]]) -> tuple[np.ndarray, list[np.ndarray]]:
+def decode_h265_frames(
+    chunks: list[tuple[int, bytes]],
+    out_hw: tuple[int, int] | None = None,
+    hwaccel: str | None = None,
+) -> tuple[np.ndarray, list[np.ndarray]]:
     """Decode an ordered list of H.265 chunks.
 
-    Returns ``(timestamps_ns, [HxWx3 uint8 RGB ndarray, ...])``. The two lists
-    are aligned 1:1 by decode order.
+    Args:
+        chunks: ordered list of ``(timestamp_ns, encoded_bytes)``.
+        out_hw: optional ``(h, w)``. When provided, decoded frames are resized
+            inside the same PyAV pipeline (one ``sws_scale`` pass instead of a
+            decode → ndarray → re-wrap → resize round-trip).
+        hwaccel: optional PyAV hwaccel hint. Pass ``"cuda"`` to use NVDEC when
+            available (requires an FFmpeg with ``hevc_cuvid``). Falls back to
+            CPU decode silently if unsupported.
+
+    Returns ``(timestamps_ns, [HxWx3 uint8 RGB ndarray, ...])``.
     """
     if not chunks:
         return np.zeros(0, dtype=np.int64), []
-    codec = av.CodecContext.create("hevc", "r")
+
+    codec = None
+    if hwaccel == "cuda":
+        try:
+            codec = av.CodecContext.create("hevc_cuvid", "r")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hevc_cuvid unavailable, falling back to CPU: %s", e)
+            codec = None
+    if codec is None:
+        codec = av.CodecContext.create("hevc", "r")
+        # CPU HEVC decoder benefits a lot from threading.
+        codec.thread_type = "FRAME"
+        codec.thread_count = max(1, (os.cpu_count() or 4) // 2)
+
     out_frames: list[np.ndarray] = []
     out_ts: list[int] = []
+
+    def _emit(fr: av.VideoFrame, ts: int) -> None:
+        if out_hw is not None:
+            h, w = out_hw
+            fr = fr.reformat(width=w, height=h, format="rgb24")
+            out_frames.append(fr.to_ndarray(format="rgb24"))
+        else:
+            out_frames.append(fr.to_ndarray(format="rgb24"))
+        out_ts.append(ts)
+
     for ts, data in chunks:
         try:
             packets = codec.parse(bytes(data))
@@ -181,35 +244,28 @@ def decode_h265_frames(chunks: list[tuple[int, bytes]]) -> tuple[np.ndarray, lis
                 logger.debug("decode error at ts=%d: %s", ts, e)
                 continue
             for fr in frames:
-                out_frames.append(fr.to_ndarray(format="rgb24"))
-                out_ts.append(ts)
+                _emit(fr, ts)
     try:
         for fr in codec.decode(None):
-            out_frames.append(fr.to_ndarray(format="rgb24"))
-            out_ts.append(chunks[-1][0])
+            _emit(fr, chunks[-1][0])
     except Exception:
         pass
     return np.asarray(out_ts, dtype=np.int64), out_frames
-
-
-def resize_rgb(img: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
-    """Letterbox-free resize to (h, w) using PyAV (no extra deps)."""
-    h, w = hw
-    if img.shape[:2] == (h, w):
-        return img
-    frame = av.VideoFrame.from_ndarray(img, format="rgb24")
-    frame = frame.reformat(width=w, height=h, format="rgb24")
-    return frame.to_ndarray(format="rgb24")
 
 
 # ── Per-episode conversion ───────────────────────────────────────────────────
 def convert_episode(
     mcap_path: Path,
     dataset: LeRobotDataset,
-    image_size: tuple[int, int],
+    image_size: tuple[int, int] | None,
     fallback_task: str,
+    hwaccel: str | None = None,
 ) -> int:
-    """Convert one MCAP into one episode of ``dataset``. Returns frames written."""
+    """Convert one MCAP into one episode of ``dataset``. Returns frames written.
+
+    ``image_size=None`` keeps native camera resolution (fastest — skips the
+    sws_scale pass entirely).
+    """
     msgs = read_mcap(mcap_path)
 
     required = [
@@ -221,16 +277,21 @@ def convert_episode(
     if missing:
         raise RuntimeError(f"missing topics: {missing}")
 
-    # Decode each camera (independently — frame counts may differ slightly).
+    # Decode the 3 cameras in parallel threads. PyAV releases the GIL during
+    # libavcodec calls, so this is a real ~3× speedup on a multicore CPU.
+    def _decode_one(name: str) -> tuple[str, np.ndarray, list[np.ndarray]]:
+        chunks = [(ts, m.data) for ts, m in msgs.get(CAMERA_TOPICS[name], [])]
+        ts_arr, frames = decode_h265_frames(chunks, out_hw=image_size, hwaccel=hwaccel)
+        if not frames:
+            raise RuntimeError(f"camera {name!r} ({CAMERA_TOPICS[name]}) decoded 0 frames")
+        return name, ts_arr, frames
+
     cam_ts: dict[str, np.ndarray] = {}
     cam_frames: dict[str, list[np.ndarray]] = {}
-    for name, topic in CAMERA_TOPICS.items():
-        chunks = [(ts, m.data) for ts, m in msgs.get(topic, [])]
-        ts_arr, frames = decode_h265_frames(chunks)
-        if len(frames) == 0:
-            raise RuntimeError(f"camera {name!r} ({topic}) decoded 0 frames")
-        cam_ts[name] = ts_arr
-        cam_frames[name] = frames
+    with ThreadPoolExecutor(max_workers=len(CAMERA_TOPICS)) as ex:
+        for name, ts_arr, frames in ex.map(_decode_one, CAMERA_TOPICS.keys()):
+            cam_ts[name] = ts_arr
+            cam_frames[name] = frames
 
     # Master timeline = master camera timestamps.
     master_ts = cam_ts[MASTER_CAMERA]
@@ -299,8 +360,7 @@ def convert_episode(
             "task": task,
         }
         for name in CAMERA_TOPICS:
-            img = cam_frames[name][cam_idx[name][i]]
-            frame[f"observation.images.{name}"] = resize_rgb(img, image_size)
+            frame[f"observation.images.{name}"] = cam_frames[name][cam_idx[name][i]]
 
         dataset.add_frame(frame)
         written += 1
@@ -313,6 +373,7 @@ def convert_episode(
 
 # ── Per-task driver ──────────────────────────────────────────────────────────
 def features_dict(image_size: tuple[int, int]) -> dict:
+    """``image_size`` here is the (h, w) actually stored in the videos."""
     h, w = image_size
     feats: dict = {
         "observation.state": {
@@ -349,38 +410,84 @@ def features_dict(image_size: tuple[int, int]) -> dict:
     return feats
 
 
+def detect_native_size(mcap_path: Path, hwaccel: str | None = None) -> tuple[int, int]:
+    """Decode just the first frame of the master camera to discover (h, w)."""
+    msgs = read_mcap(mcap_path)
+    chunks = [(ts, m.data) for ts, m in msgs.get(CAMERA_TOPICS[MASTER_CAMERA], [])]
+    if not chunks:
+        raise RuntimeError(f"no master-camera frames in {mcap_path}")
+    # Only decode enough chunks to emit one frame.
+    _, frames = decode_h265_frames(chunks[:8], out_hw=None, hwaccel=hwaccel)
+    if not frames:
+        # Fall back to decoding all chunks if 8 wasn't enough for a keyframe.
+        _, frames = decode_h265_frames(chunks, out_hw=None, hwaccel=hwaccel)
+    if not frames:
+        raise RuntimeError(f"could not decode any frames from {mcap_path}")
+    h, w = frames[0].shape[:2]
+    return int(h), int(w)
+
+
 def convert_task(
     task_dir: Path,
     dst_root: Path,
     repo_id: str,
     fps: int,
-    image_size: tuple[int, int],
+    image_size: tuple[int, int] | None,
     vcodec: str,
     skip_existing: bool,
-) -> None:
+    streaming_encoding: bool = True,
+    image_writer_threads: int = 4,
+    image_writer_processes: int = 0,
+    hwaccel: str | None = None,
+    parallel_episode_encoding: bool = True,
+    log_level: str = "INFO",
+) -> tuple[str, int, int]:
+    """Convert one task. Returns (task_name, episodes_ok, episodes_total)."""
+    # When invoked from a worker process the parent's logging config is lost.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        )
+
     task_name = task_dir.name
     out_root = dst_root / task_name
     if skip_existing and (out_root / "meta" / "info.json").exists():
         logger.info("[skip] %s — already converted at %s", task_name, out_root)
-        return
+        return task_name, 0, 0
 
     mcaps = sorted(task_dir.glob("*/output.mcap"))
     if not mcaps:
         logger.warning("[skip] %s — no */output.mcap found", task_name)
-        return
+        return task_name, 0, 0
 
-    logger.info("[task=%s] %d episodes → %s", task_name, len(mcaps), out_root)
+    # Decide stored image size: explicit (h, w) or native (peek at first MCAP).
+    if image_size is None:
+        stored_hw = detect_native_size(mcaps[0], hwaccel=hwaccel)
+        logger.info("[task=%s] using native image size %s", task_name, stored_hw)
+    else:
+        stored_hw = image_size
+
+    logger.info("[task=%s] %d episodes → %s (vcodec=%s, streaming=%s, hwaccel=%s)",
+                task_name, len(mcaps), out_root, vcodec, streaming_encoding, hwaccel)
     out_root.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
-        features=features_dict(image_size),
+        features=features_dict(stored_hw),
         root=out_root,
         robot_type="bimanual_robot",
         use_videos=True,
         vcodec=vcodec,
+        streaming_encoding=streaming_encoding,
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=image_writer_processes,
     )
+
+    # When ``add_frame`` resizes, ``image_size`` for ``convert_episode`` matches
+    # the dataset's stored size; when keeping native, pass None to skip resize.
+    convert_image_size = stored_hw if image_size is not None else None
 
     n_ok = 0
     try:
@@ -389,8 +496,9 @@ def convert_task(
                 n = convert_episode(
                     mcap_path=mcap,
                     dataset=dataset,
-                    image_size=image_size,
+                    image_size=convert_image_size,
                     fallback_task=task_name.replace("_", " "),
+                    hwaccel=hwaccel,
                 )
                 logger.info("  [%d/%d] %s → %d frames", k + 1, len(mcaps), mcap.parent.name, n)
                 if n > 0:
@@ -401,9 +509,13 @@ def convert_task(
                 if dataset.has_pending_frames():
                     dataset.clear_episode_buffer()
     finally:
+        # ``parallel_encoding=False`` for save_episode is implied by streaming.
+        # The dataset's ``finalize`` flushes everything regardless.
+        _ = parallel_episode_encoding  # currently unused; reserved for future.
         dataset.finalize()
 
     logger.info("[task=%s] done — %d/%d episodes converted", task_name, n_ok, len(mcaps))
+    return task_name, n_ok, len(mcaps)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -417,9 +529,34 @@ def parse_args() -> argparse.Namespace:
                    help="HF Hub username — used to namespace each task's repo_id (no upload happens here).")
     p.add_argument("--fps", type=int, default=30, help="Master FPS (camera rate). Default: 30.")
     p.add_argument("--image-size", type=int, default=512,
-                   help="Square resize for stored video frames. Default: 512.")
-    p.add_argument("--vcodec", default="libsvtav1",
-                   help="Output video codec for LeRobotDataset (default: libsvtav1; try 'h264' for speed).")
+                   help="Square resize for stored video frames. Use 0 to keep native resolution. Default: 512.")
+    p.add_argument(
+        "--vcodec", default="h264",
+        help=(
+            "Output video codec for LeRobotDataset. Default: 'h264' (≈10× faster than 'libsvtav1'). "
+            "Try 'h264_nvenc' for GPU-accelerated encode if FFmpeg has NVENC."
+        ),
+    )
+    p.add_argument(
+        "--hwaccel", default=None, choices=[None, "cuda"],
+        help="HEVC decode acceleration. 'cuda' uses NVDEC (hevc_cuvid) when available.",
+    )
+    p.add_argument(
+        "--num-workers", type=int, default=1,
+        help="Number of tasks to convert in parallel (each as a separate process). Default: 1.",
+    )
+    p.add_argument(
+        "--no-streaming-encoding", action="store_true",
+        help="Disable streaming video encoding (slower, but simpler error model).",
+    )
+    p.add_argument(
+        "--image-writer-threads", type=int, default=4,
+        help="Threads used by LeRobotDataset for image/PNG writes. Default: 4.",
+    )
+    p.add_argument(
+        "--image-writer-processes", type=int, default=0,
+        help="Subprocesses for image writes (0 = use threads only). Default: 0.",
+    )
     p.add_argument("--tasks", nargs="*", default=None,
                    help="Optional explicit list of task subdir names. Default: all subdirs of --src.")
     p.add_argument("--skip-existing", action="store_true",
@@ -453,29 +590,65 @@ def main() -> int:
         logger.error("No task dirs found under %s", src)
         return 2
 
-    image_size = (args.image_size, args.image_size)
+    image_size: tuple[int, int] | None = (
+        None if args.image_size == 0 else (args.image_size, args.image_size)
+    )
 
+    common_kwargs = dict(
+        dst_root=args.dst,
+        fps=args.fps,
+        image_size=image_size,
+        vcodec=args.vcodec,
+        skip_existing=args.skip_existing,
+        streaming_encoding=not args.no_streaming_encoding,
+        image_writer_threads=args.image_writer_threads,
+        image_writer_processes=args.image_writer_processes,
+        hwaccel=args.hwaccel,
+        log_level=args.log_level,
+    )
+
+    jobs = []
     for td in task_dirs:
         if not td.is_dir():
             logger.warning("[skip] %s — not a directory", td)
             continue
-        repo_id = f"{args.hf_user}/{td.name}"
-        try:
-            convert_task(
-                task_dir=td,
-                dst_root=args.dst,
-                repo_id=repo_id,
-                fps=args.fps,
-                image_size=image_size,
-                vcodec=args.vcodec,
-                skip_existing=args.skip_existing,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.error("[task=%s] FAILED: %s", td.name, e)
-            logger.debug("%s", traceback.format_exc())
+        jobs.append((td, f"{args.hf_user}/{td.name}"))
+
+    def _run(td: Path, repo_id: str) -> tuple[str, int, int]:
+        return convert_task(task_dir=td, repo_id=repo_id, **common_kwargs)
+
+    if args.num_workers <= 1:
+        for td, repo_id in jobs:
+            try:
+                _run(td, repo_id)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[task=%s] FAILED: %s", td.name, e)
+                logger.debug("%s", traceback.format_exc())
+    else:
+        ctx = mp.get_context("spawn")
+        # Wrap convert_task as a top-level partial so it pickles for spawn.
+        worker = partial(_convert_task_entrypoint, common_kwargs=common_kwargs)
+        with ctx.Pool(processes=args.num_workers) as pool:
+            for res in pool.imap_unordered(worker, jobs):
+                if isinstance(res, tuple) and len(res) == 3:
+                    name, ok, total = res
+                    logger.info("[task=%s] reported %d/%d episodes converted", name, ok, total)
+                else:
+                    logger.error("worker returned unexpected: %r", res)
 
     logger.info("All done. Output root: %s", args.dst)
     return 0
+
+
+def _convert_task_entrypoint(job: tuple[Path, str], common_kwargs: dict) -> tuple[str, int, int]:
+    """Top-level helper so ``mp.Pool`` (spawn context) can pickle it."""
+    td, repo_id = job
+    try:
+        return convert_task(task_dir=td, repo_id=repo_id, **common_kwargs)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("port_mcap").error("[task=%s] FAILED in worker: %s", td.name, e)
+        logging.getLogger("port_mcap").debug("%s", traceback.format_exc())
+        return td.name, 0, -1
 
 
 if __name__ == "__main__":
