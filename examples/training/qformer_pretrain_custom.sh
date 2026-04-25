@@ -103,6 +103,23 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Camera rename map.
+#
+# ``lerobot/smolvla_base`` was trained with cameras named ``camera1/2/3``.
+# The MCAP converter writes ``observation.images.{left,right,top}`` to be
+# human-readable. Without a rename, ``make_policy`` fails with a
+# Feature mismatch error. Default below maps:
+#   left  → camera1
+#   right → camera2
+#   top   → camera3
+#
+# Override with RENAME_MAP='{...}' if your dataset uses different keys, or set
+# RENAME_MAP='{}' to disable.
+# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_RENAME_MAP='{"observation.images.left": "observation.images.camera1", "observation.images.right": "observation.images.camera2", "observation.images.top": "observation.images.camera3"}'
+RENAME_MAP="${RENAME_MAP:-${DEFAULT_RENAME_MAP}}"
+
 if [[ "${LORA_VLM}" == "true" ]]; then
   TRAIN_EXPERT_ONLY="false"
 else
@@ -155,6 +172,13 @@ pretrain_one() {
     return 0
   fi
 
+  # Auto-clean a partial output dir from a previous failed attempt, so
+  # ``lerobot-train``'s "output dir already exists" check doesn't fire.
+  if [[ -d "${output_dir}" && ! -d "${output_dir}/checkpoints" ]]; then
+    echo ">>> [clean-partial] ${run_name}: removing partial ${output_dir}" | tee -a "${SUMMARY_LOG}"
+    rm -rf "${output_dir}"
+  fi
+
   echo ">>> [stage1-pretrain] ${run_name}" | tee -a "${SUMMARY_LOG}"
   local args=(
     --policy.path="${POLICY_PATH}"
@@ -179,6 +203,9 @@ pretrain_one() {
   )
   if [[ -n "${CUSTOM_DATASET_ROOT}" ]]; then
     args+=(--dataset.root="${CUSTOM_DATASET_ROOT}")
+  fi
+  if [[ -n "${RENAME_MAP}" && "${RENAME_MAP}" != "{}" ]]; then
+    args+=(--rename_map="${RENAME_MAP}")
   fi
   if [[ "${USE_PEFT}" == "true" ]]; then
     args+=(--peft.method_type=LORA --peft.r="${PEFT_R}")
