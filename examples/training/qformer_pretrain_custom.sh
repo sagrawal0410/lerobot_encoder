@@ -104,6 +104,17 @@ SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Frame timestamp tolerance.
+#
+# After ``aggregate_datasets()`` concatenates per-episode MP4s into multi-episode
+# files, per-episode timestamps drift by a few microseconds from what's stored
+# in the parquet (pure float32 precision). The default 100 µs tolerance is
+# tighter than that drift, which raises ``FrameTimestampError``. Bumping to
+# 1 ms (still ≪ frame interval at 30 Hz = 33 ms) is safe and silences it.
+# ──────────────────────────────────────────────────────────────────────────────
+TOLERANCE_S="${TOLERANCE_S:-0.001}"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Camera rename map.
 #
 # ``lerobot/smolvla_base`` was trained with cameras named ``camera1/2/3``.
@@ -200,6 +211,7 @@ pretrain_one() {
     --job_name="stage1_${run_name}"
     --wandb.enable="${WANDB_ENABLE}"
     --wandb.project="${WANDB_PROJECT}"
+    --tolerance_s="${TOLERANCE_S}"
   )
   if [[ -n "${CUSTOM_DATASET_ROOT}" ]]; then
     args+=(--dataset.root="${CUSTOM_DATASET_ROOT}")
