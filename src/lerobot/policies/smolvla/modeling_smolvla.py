@@ -497,21 +497,45 @@ class SmolVLAPolicy(PreTrainedPolicy):
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
-        target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        # Always-on targets: action expert + SmolVLA projection heads.
+        target_alternatives = [
+            r"model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj",
+            rf"model\.({common_projections})",
+        ]
+        if getattr(self.config, "lora_target_vlm_text_model", False):
+            # SmolVLM2's text backbone lives at vlm.model.text_model.layers.*.
+            target_alternatives.append(
+                r"model\.vlm_with_expert\.vlm\.model\.text_model\.layers\..*\.(q|v)_proj"
+            )
+        target_modules = "(" + "|".join(target_alternatives) + ")"
+
+        modules_to_save: list[str] = []
+        if getattr(self.config, "use_qformer", False):
+            modules_to_save.append("qformer")
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
         """Validate PEFT configuration for SmolVLA."""
         super()._validate_peft_config(peft_config)
-        if not self.config.load_vlm_weights:
-            import logging
+        import logging
 
+        if not self.config.load_vlm_weights:
             logging.warning(
                 "Training SmolVLA from scratch using PEFT. This is unlikely to yield good results. "
                 "Set `load_vlm_weights=True` to fine-tune the existing policy."
+            )
+        if (
+            getattr(self.config, "lora_target_vlm_text_model", False)
+            and getattr(self.config, "train_expert_only", True)
+        ):
+            logging.warning(
+                "`lora_target_vlm_text_model=True` is set but `train_expert_only=True`. "
+                "The SmolVLM backbone (including LoRA adapters) will be kept in eval() mode "
+                "by `SmolVLMWithExpertModel.train()`. Set `--policy.train_expert_only=false` "
+                "to allow the LoRA adapters to behave like a normal training module."
             )
 
 
@@ -579,6 +603,14 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            use_qformer=self.config.use_qformer,
+            qformer_num_queries=self.config.qformer_num_queries,
+            qformer_num_layers=self.config.qformer_num_layers,
+            qformer_num_heads=self.config.qformer_num_heads,
+            qformer_hidden_dim=self.config.qformer_hidden_dim,
+            qformer_mlp_ratio=self.config.qformer_mlp_ratio,
+            qformer_dropout=self.config.qformer_dropout,
+            qformer_self_attn_every_n_layers=self.config.qformer_self_attn_every_n_layers,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -663,7 +695,6 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_start_mask)
 
             img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]

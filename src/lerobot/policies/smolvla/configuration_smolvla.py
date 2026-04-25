@@ -90,6 +90,19 @@ class SmolVLAConfig(PreTrainedConfig):
 
     prefix_length: int = -1
 
+    use_qformer: bool = False
+    qformer_num_queries: int = 32
+    qformer_num_layers: int = 3
+    qformer_num_heads: int = 8
+    qformer_mlp_ratio: float = 4.0
+    qformer_dropout: float = 0.0
+    # If None, defaults to the LLM hidden size (``text_config.hidden_size``).
+    qformer_hidden_dim: int | None = None
+    # Cadence of query↔query self-attention inside each block. 1 = every
+    # block (BLIP-2 style), 2 = every other, 0 = disable (cross-attn-only).
+    qformer_self_attn_every_n_layers: int = 1
+    lora_target_vlm_text_model: bool = False
+
     pad_language_to: str = "longest"  # "max_length"
 
     num_expert_layers: int = -1  # Less or equal to 0 is the default where the action expert has the same number of layers of VLM. Otherwise the expert have less layers.
@@ -119,6 +132,20 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.use_qformer:
+            if self.qformer_num_queries <= 0:
+                raise ValueError(
+                    f"`qformer_num_queries` must be > 0, got {self.qformer_num_queries}."
+                )
+            if self.qformer_num_layers <= 0:
+                raise ValueError(
+                    f"`qformer_num_layers` must be > 0, got {self.qformer_num_layers}."
+                )
+            if self.qformer_hidden_dim is not None and self.qformer_hidden_dim % self.qformer_num_heads != 0:
+                raise ValueError(
+                    f"`qformer_hidden_dim` ({self.qformer_hidden_dim}) must be divisible by "
+                    f"`qformer_num_heads` ({self.qformer_num_heads})."
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -20,6 +20,8 @@ from torch import nn
 
 from lerobot.utils.import_utils import _transformers_available, require_package
 
+from .qformer import QFormer
+
 if TYPE_CHECKING or _transformers_available:
     from transformers import (
         AutoConfig,
@@ -82,6 +84,14 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        use_qformer: bool = False,
+        qformer_num_queries: int = 32,
+        qformer_num_layers: int = 2,
+        qformer_num_heads: int = 8,
+        qformer_hidden_dim: int | None = None,
+        qformer_mlp_ratio: float = 4.0,
+        qformer_dropout: float = 0.0,
+        qformer_self_attn_every_n_layers: int = 1,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -142,6 +152,24 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        self.use_qformer = use_qformer
+        if use_qformer:
+            llm_hidden_size = self.config.text_config.hidden_size
+            vision_hidden_size = self.get_vlm_model().vision_model.config.hidden_size
+            self.qformer = QFormer(
+                num_queries=qformer_num_queries,
+                hidden_dim=qformer_hidden_dim if qformer_hidden_dim is not None else llm_hidden_size,
+                kv_dim=vision_hidden_size,
+                out_dim=llm_hidden_size,
+                num_layers=qformer_num_layers,
+                num_heads=qformer_num_heads,
+                mlp_ratio=qformer_mlp_ratio,
+                dropout=qformer_dropout,
+                self_attn_every_n_layers=qformer_self_attn_every_n_layers,
+            )
+
+            self.qformer = self.qformer.to(dtype=self.get_vlm_model().vision_model.dtype)
+
         self.set_requires_grad()
 
     def get_vlm_model(self):
@@ -179,6 +207,11 @@ class SmolVLMWithExpertModel(nn.Module):
             if "lm_head" in name:
                 params.requires_grad = False
 
+
+        if getattr(self, "use_qformer", False):
+            for params in self.qformer.parameters():
+                params.requires_grad = True
+
     def train(self, mode: bool = True):
         super().train(mode)
 
@@ -199,8 +232,10 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             .last_hidden_state
         )
-        # Modality projection & resampling
-        image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
+        if self.use_qformer:
+            image_hidden_states = self.qformer(image_hidden_states)
+        else:
+            image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
         return image_hidden_states
 
     def embed_language_tokens(self, tokens: torch.Tensor):
