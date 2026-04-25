@@ -103,10 +103,15 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
-# SmolVLA defaults push_to_hub=True. After 5 hours of training, a missing
-# HF_TOKEN crashes the run *after* the checkpoint is already saved — and
-# ``set -euo pipefail`` stops the rest of the sweep. Default to OFF; opt in
-# explicitly with ``PUSH_TO_HUB=true`` (then also export HF_TOKEN).
+# ──────────────────────────────────────────────────────────────────────────────
+# Hub push.
+#
+# ``lerobot.configs.policies.PreTrainedConfig.push_to_hub`` defaults to True.
+# Combined with ``--policy.repo_id``, that triggers a Hub upload at the end of
+# every (N, seed) run. If the upload fails (auth / rate limit / network), the
+# whole sweep aborts (``set -euo pipefail``). We default it OFF; opt back in
+# explicitly by setting PUSH_TO_HUB=true (and HF_TOKEN with write access).
+# ──────────────────────────────────────────────────────────────────────────────
 PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -235,7 +240,10 @@ pretrain_one() {
 
 for N in ${N_VALUES}; do
   for SEED in ${SEEDS}; do
-    pretrain_one "${N}" "${SEED}"
+    if ! pretrain_one "${N}" "${SEED}"; then
+      echo ">>> [WARNING] qformer_n${N}_s${SEED} FAILED — continuing with the next (N, seed)" \
+        | tee -a "${SUMMARY_LOG}"
+    fi
   done
 done
 

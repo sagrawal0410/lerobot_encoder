@@ -93,6 +93,10 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
+# Disable HF Hub push by default (same reason as Stage 1: a failing upload
+# would abort the whole benchmark sweep). Opt in with PUSH_TO_HUB=true.
+PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-benchmark step / batch / eval overrides.
 #
@@ -135,11 +139,6 @@ RENAME_MAP="${RENAME_MAP:-}"
 LIBERO_RENAME_MAP="${LIBERO_RENAME_MAP:-${RENAME_MAP}}"
 METAWORLD_RENAME_MAP="${METAWORLD_RENAME_MAP:-${RENAME_MAP}}"
 ROBOTWIN_RENAME_MAP="${ROBOTWIN_RENAME_MAP:-${RENAME_MAP}}"
-
-# SmolVLA defaults push_to_hub=True, which crashes the post-training step with
-# 401 Unauthorized when no HF write token is set. Default OFF; opt in with
-# ``PUSH_TO_HUB=true`` (then also export HF_TOKEN).
-PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 
 LIBERO_DATASET="${LIBERO_DATASET:-HuggingFaceVLA/libero}"
 METAWORLD_DATASET="${METAWORLD_DATASET:-lerobot/metaworld_mt50}"
@@ -335,9 +334,16 @@ for BENCHMARK in ${BENCHMARKS}; do
   echo "=== Benchmark: ${BENCHMARK} ===" | tee -a "${SUMMARY_LOG}"
   for N in ${N_VALUES}; do
     for SEED in ${SEEDS}; do
-      finetune_one "${BENCHMARK}" "${N}" "${SEED}"
+      if ! finetune_one "${BENCHMARK}" "${N}" "${SEED}"; then
+        echo ">>> [WARNING] ${BENCHMARK}/qformer_n${N}_s${SEED} finetune FAILED — skipping its final eval and continuing" \
+          | tee -a "${SUMMARY_LOG}"
+        continue
+      fi
       if [[ "${RUN_FINAL_EVAL}" == "true" ]]; then
-        final_eval_one "${BENCHMARK}" "${N}" "${SEED}"
+        if ! final_eval_one "${BENCHMARK}" "${N}" "${SEED}"; then
+          echo ">>> [WARNING] ${BENCHMARK}/qformer_n${N}_s${SEED} final eval FAILED — continuing" \
+            | tee -a "${SUMMARY_LOG}"
+        fi
       fi
     done
   done
