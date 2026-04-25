@@ -83,7 +83,10 @@ N_VALUES="${N_VALUES:-8 16 32 64 128}"
 SEEDS="${SEEDS:-0}"
 CUSTOM_DATASET_ROOT="${CUSTOM_DATASET_ROOT:-}"
 POLICY_PATH="${POLICY_PATH:-lerobot/smolvla_base}"
-STEPS="${STEPS:-100000}"
+# Default raised vs. per-task pretraining: the merged dataset is much larger,
+# so we want longer training to actually walk over it. SmolVLA's own base was
+# trained for ~200k steps over a comparable multi-task pool.
+STEPS="${STEPS:-200000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-4}"
 DECAY_LR="${DECAY_LR:-2.5e-6}"
@@ -110,9 +113,11 @@ STAGE1_ROOT="${OUTPUT_ROOT}/stage1"
 mkdir -p "${STAGE1_ROOT}"
 SUMMARY_LOG="${STAGE1_ROOT}/stage1_summary.txt"
 date | tee -a "${SUMMARY_LOG}" >/dev/null
-echo "Stage 1 (custom-data pretrain) started" | tee -a "${SUMMARY_LOG}"
+echo "Stage 1 (SmolVLA-style merged-dataset base pretrain) started" | tee -a "${SUMMARY_LOG}"
 echo "  HF_USER=${HF_USER}  N_VALUES='${N_VALUES}'  SEEDS='${SEEDS}'" | tee -a "${SUMMARY_LOG}"
-echo "  Custom dataset: ${CUSTOM_DATASET_REPO_ID}  (root='${CUSTOM_DATASET_ROOT:-<hub>}')" | tee -a "${SUMMARY_LOG}"
+echo "  Merged dataset: ${CUSTOM_DATASET_REPO_ID}  (root='${CUSTOM_DATASET_ROOT:-<hub>}')" | tee -a "${SUMMARY_LOG}"
+echo "  Base policy:    ${POLICY_PATH}" | tee -a "${SUMMARY_LOG}"
+echo "  Steps:          ${STEPS}  Batch (per-proc): ${BATCH_SIZE}  LR=${LR}" | tee -a "${SUMMARY_LOG}"
 echo "  W&B project:    ${WANDB_PROJECT}" | tee -a "${SUMMARY_LOG}"
 
 run() {

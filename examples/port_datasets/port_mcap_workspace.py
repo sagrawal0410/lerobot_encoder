@@ -58,7 +58,14 @@ Usage (fast — multiple tasks in parallel, GPU decode if available):
         --vcodec h264_nvenc \\
         --hwaccel cuda \\
         --num-workers 4 \\
+        --num-workers 4 \\
         --image-writer-threads 8
+
+Usage (zero-resize — store native resolution videos, fastest for CPU):
+
+    python examples/port_datasets/port_mcap_workspace.py \\
+        --src /workspace --dst /workspace/lerobot --hf-user sagrawal0410 \\
+        --image-size 0 --vcodec h264 --num-workers $(nproc)
 
 Usage (zero-resize — store native resolution videos, fastest for CPU):
 
