@@ -103,6 +103,12 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
 ACCELERATE_LAUNCH_ARGS="${ACCELERATE_LAUNCH_ARGS:-}"
 
+# SmolVLA defaults push_to_hub=True. After 5 hours of training, a missing
+# HF_TOKEN crashes the run *after* the checkpoint is already saved — and
+# ``set -euo pipefail`` stops the rest of the sweep. Default to OFF; opt in
+# explicitly with ``PUSH_TO_HUB=true`` (then also export HF_TOKEN).
+PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Frame timestamp tolerance.
 #
@@ -202,6 +208,7 @@ pretrain_one() {
     --policy.optimizer_lr="${LR}"
     --policy.scheduler_decay_lr="${DECAY_LR}"
     --policy.repo_id="${repo_id}"
+    --policy.push_to_hub="${PUSH_TO_HUB}"
     --dataset.repo_id="${CUSTOM_DATASET_REPO_ID}"
     --steps="${STEPS}"
     --batch_size="${BATCH_SIZE}"

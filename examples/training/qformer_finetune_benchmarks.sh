@@ -136,6 +136,11 @@ LIBERO_RENAME_MAP="${LIBERO_RENAME_MAP:-${RENAME_MAP}}"
 METAWORLD_RENAME_MAP="${METAWORLD_RENAME_MAP:-${RENAME_MAP}}"
 ROBOTWIN_RENAME_MAP="${ROBOTWIN_RENAME_MAP:-${RENAME_MAP}}"
 
+# SmolVLA defaults push_to_hub=True, which crashes the post-training step with
+# 401 Unauthorized when no HF write token is set. Default OFF; opt in with
+# ``PUSH_TO_HUB=true`` (then also export HF_TOKEN).
+PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
+
 LIBERO_DATASET="${LIBERO_DATASET:-HuggingFaceVLA/libero}"
 METAWORLD_DATASET="${METAWORLD_DATASET:-lerobot/metaworld_mt50}"
 ROBOTWIN_DATASET="${ROBOTWIN_DATASET:-lerobot/robotwin_unified}"
@@ -264,6 +269,7 @@ finetune_one() {
     --policy.optimizer_lr="${LR}"
     --policy.scheduler_decay_lr="${DECAY_LR}"
     --policy.repo_id="${repo_id}"
+    --policy.push_to_hub="${PUSH_TO_HUB}"
     --dataset.repo_id="${BENCH_DATASET}"
     --env.type="${bench}"
     --env.task="${BENCH_EVAL_TASKS}"
