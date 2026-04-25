@@ -121,13 +121,6 @@ PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 # ──────────────────────────────────────────────────────────────────────────────
 TOLERANCE_S="${TOLERANCE_S:-0.001}"
 
-# Video decoder backend. Default ``pyav`` because torchcodec drags in conda's
-# libstdc++ which often clashes with the system libstdc++ on stock pods (see
-# CXXABI_1.3.15 errors). PyAV is pure-Python on libav, no C++ ABI dance.
-# Override with VIDEO_BACKEND=torchcodec if you've fixed the libstdc++ load
-# order on your system.
-VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Camera rename map.
 #
@@ -230,9 +223,6 @@ pretrain_one() {
   )
   if [[ -n "${CUSTOM_DATASET_ROOT}" ]]; then
     args+=(--dataset.root="${CUSTOM_DATASET_ROOT}")
-  fi
-  if [[ -n "${VIDEO_BACKEND}" ]]; then
-    args+=(--dataset.video_backend="${VIDEO_BACKEND}")
   fi
   if [[ -n "${RENAME_MAP}" && "${RENAME_MAP}" != "{}" ]]; then
     args+=(--rename_map="${RENAME_MAP}")
