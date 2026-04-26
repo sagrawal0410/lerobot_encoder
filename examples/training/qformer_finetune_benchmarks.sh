@@ -350,7 +350,7 @@ final_eval_one() {
     --policy.empty_cameras="${BENCH_EMPTY_CAMERAS}"
     --env.type="${bench}"
     --env.task="${BENCH_EVAL_TASKS}"
-    --eval.batch_size=1
+    --eval.batch_size=2
     --eval.n_episodes="${EVAL_N_EPISODES_FINAL}"
     --output_dir="${eval_dir}"
   )
