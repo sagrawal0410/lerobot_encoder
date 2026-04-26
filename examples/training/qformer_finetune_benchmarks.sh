@@ -40,6 +40,12 @@
 #   USE_PEFT                  true|false                  (default: false)
 #   PEFT_R                                                (default: 64)
 #   LORA_VLM                                              (default: false)
+#   FREEZE_QFORMER            true|false                  (default: true)
+#                             Keeps Stage-1 Q-Former weights fixed so the
+#                             Stage-2 sweep over N (queries) measures only
+#                             the bottleneck's transferability, not how
+#                             easily it re-fits per benchmark. Set to false
+#                             to also adapt visual queries downstream.
 #   OUTPUT_ROOT                                           (default: ./outputs/qformer_pipeline)
 #   WANDB_PROJECT_PREFIX      W&B project prefix          (default: smolvla-qformer)
 #                             → projects:  ${PREFIX}-${benchmark}
@@ -86,6 +92,12 @@ SAVE_FREQ="${SAVE_FREQ:-25000}"
 USE_PEFT="${USE_PEFT:-false}"
 PEFT_R="${PEFT_R:-64}"
 LORA_VLM="${LORA_VLM:-false}"
+# Freeze Q-Former during Stage-2 finetune by default. This preserves the
+# generalist visual abstractions learned in Stage-1 pretraining and keeps
+# the N-queries ablation signal clean (otherwise each benchmark re-fits its
+# own Q-Former on a small downstream dataset). Set FREEZE_QFORMER=false to
+# unfreeze and let Stage 2 also adapt the visual queries.
+FREEZE_QFORMER="${FREEZE_QFORMER:-true}"
 WANDB_PROJECT_PREFIX="${WANDB_PROJECT_PREFIX:-smolvla-qformer}"
 WANDB_ENABLE="${WANDB_ENABLE:-true}"
 RUN_FINAL_EVAL="${RUN_FINAL_EVAL:-true}"
@@ -276,6 +288,7 @@ finetune_one() {
     --policy.path="${starting_ckpt}"
     --policy.use_qformer=true
     --policy.qformer_num_queries="${n}"
+    --policy.freeze_qformer="${FREEZE_QFORMER}"
     --policy.lora_target_vlm_text_model="${LORA_VLM}"
     --policy.train_expert_only="${TRAIN_EXPERT_ONLY}"
     --policy.optimizer_lr="${LR}"

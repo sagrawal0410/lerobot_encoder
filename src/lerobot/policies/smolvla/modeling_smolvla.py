@@ -611,6 +611,7 @@ class VLAFlowMatching(nn.Module):
             qformer_mlp_ratio=self.config.qformer_mlp_ratio,
             qformer_dropout=self.config.qformer_dropout,
             qformer_self_attn_every_n_layers=self.config.qformer_self_attn_every_n_layers,
+            freeze_qformer=self.config.freeze_qformer,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size

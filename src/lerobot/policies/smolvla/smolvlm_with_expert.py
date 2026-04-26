@@ -92,6 +92,7 @@ class SmolVLMWithExpertModel(nn.Module):
         qformer_mlp_ratio: float = 4.0,
         qformer_dropout: float = 0.0,
         qformer_self_attn_every_n_layers: int = 1,
+        freeze_qformer: bool = False,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -153,6 +154,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.use_qformer = use_qformer
+        self.freeze_qformer = freeze_qformer
         if use_qformer:
             llm_hidden_size = self.config.text_config.hidden_size
             vision_hidden_size = self.get_vlm_model().vision_model.config.hidden_size
@@ -209,8 +211,11 @@ class SmolVLMWithExpertModel(nn.Module):
 
 
         if getattr(self, "use_qformer", False):
+            qformer_trainable = not getattr(self, "freeze_qformer", False)
+            if not qformer_trainable:
+                self.qformer.eval()
             for params in self.qformer.parameters():
-                params.requires_grad = True
+                params.requires_grad = qformer_trainable
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -220,6 +225,9 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if self.train_expert_only:
             self.vlm.eval()
+
+        if getattr(self, "use_qformer", False) and getattr(self, "freeze_qformer", False):
+            self.qformer.eval()
 
     def embed_image(self, image: torch.Tensor):
         patch_attention_mask = None
