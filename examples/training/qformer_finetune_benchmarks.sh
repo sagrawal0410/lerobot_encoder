@@ -88,6 +88,11 @@ DECAY_LR="${DECAY_LR:-2.5e-6}"
 EVAL_FREQ="${EVAL_FREQ:-10000}"
 EVAL_N_EPISODES_TRAIN="${EVAL_N_EPISODES_TRAIN:-3}"
 EVAL_N_EPISODES_FINAL="${EVAL_N_EPISODES_FINAL:-10}"
+# Vector-env batch size for eval rollouts. >1 parallelises N rollouts at once
+# via AsyncVectorEnv (faster eval, ~Nx env-side memory). Mid-training eval
+# runs only on rank 0, so a long eval stalls all other ranks at the next
+# DDP barrier — use this together with --ddp_timeout in ACCELERATE_LAUNCH_ARGS.
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 SAVE_FREQ="${SAVE_FREQ:-25000}"
 USE_PEFT="${USE_PEFT:-false}"
 PEFT_R="${PEFT_R:-64}"
@@ -304,7 +309,7 @@ finetune_one() {
     --seed="${seed}"
     --eval_freq="${BENCH_EVAL_FREQ}"
     --eval.n_episodes="${BENCH_EVAL_N_EPISODES_TRAIN}"
-    --eval.batch_size=1
+    --eval.batch_size="${EVAL_BATCH_SIZE}"
     --save_freq="${SAVE_FREQ}"
     --output_dir="${output_dir}"
     --job_name="${run_name}"
