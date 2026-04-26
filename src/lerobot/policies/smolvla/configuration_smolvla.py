@@ -101,11 +101,6 @@ class SmolVLAConfig(PreTrainedConfig):
     # Cadence of query↔query self-attention inside each block. 1 = every
     # block (BLIP-2 style), 2 = every other, 0 = disable (cross-attn-only).
     qformer_self_attn_every_n_layers: int = 1
-    # When True, the Q-Former (learned queries + cross/self-attn blocks +
-    # output proj) is frozen. Use during Stage-2 finetuning to preserve the
-    # generalist visual abstractions learned in Stage-1 pretraining and keep
-    # the N-queries ablation signal clean (otherwise each benchmark re-fits
-    # its own Q-Former on a small dataset). Stage-1 should leave this False.
     freeze_qformer: bool = False
     lora_target_vlm_text_model: bool = False
 

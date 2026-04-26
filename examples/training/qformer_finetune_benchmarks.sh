@@ -41,11 +41,6 @@
 #   PEFT_R                                                (default: 64)
 #   LORA_VLM                                              (default: false)
 #   FREEZE_QFORMER            true|false                  (default: true)
-#                             Keeps Stage-1 Q-Former weights fixed so the
-#                             Stage-2 sweep over N (queries) measures only
-#                             the bottleneck's transferability, not how
-#                             easily it re-fits per benchmark. Set to false
-#                             to also adapt visual queries downstream.
 #   OUTPUT_ROOT                                           (default: ./outputs/qformer_pipeline)
 #   WANDB_PROJECT_PREFIX      W&B project prefix          (default: smolvla-qformer)
 #                             → projects:  ${PREFIX}-${benchmark}
@@ -88,20 +83,11 @@ DECAY_LR="${DECAY_LR:-2.5e-6}"
 EVAL_FREQ="${EVAL_FREQ:-10000}"
 EVAL_N_EPISODES_TRAIN="${EVAL_N_EPISODES_TRAIN:-3}"
 EVAL_N_EPISODES_FINAL="${EVAL_N_EPISODES_FINAL:-10}"
-# Vector-env batch size for eval rollouts. >1 parallelises N rollouts at once
-# via AsyncVectorEnv (faster eval, ~Nx env-side memory). Mid-training eval
-# runs only on rank 0, so a long eval stalls all other ranks at the next
-# DDP barrier — use this together with --ddp_timeout in ACCELERATE_LAUNCH_ARGS.
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 SAVE_FREQ="${SAVE_FREQ:-25000}"
 USE_PEFT="${USE_PEFT:-false}"
 PEFT_R="${PEFT_R:-64}"
 LORA_VLM="${LORA_VLM:-false}"
-# Freeze Q-Former during Stage-2 finetune by default. This preserves the
-# generalist visual abstractions learned in Stage-1 pretraining and keeps
-# the N-queries ablation signal clean (otherwise each benchmark re-fits its
-# own Q-Former on a small downstream dataset). Set FREEZE_QFORMER=false to
-# unfreeze and let Stage 2 also adapt the visual queries.
 FREEZE_QFORMER="${FREEZE_QFORMER:-true}"
 WANDB_PROJECT_PREFIX="${WANDB_PROJECT_PREFIX:-smolvla-qformer}"
 WANDB_ENABLE="${WANDB_ENABLE:-true}"
@@ -148,24 +134,14 @@ ROBOTWIN_EVAL_N_EPISODES_TRAIN="${ROBOTWIN_EVAL_N_EPISODES_TRAIN:-${EVAL_N_EPISO
 # Frame-timestamp tolerance — same reasoning as Stage 1 (aggregator drift).
 TOLERANCE_S="${TOLERANCE_S:-0.001}"
 
-# Camera rename map: maps the benchmark dataset/env image keys onto the
-# ``observation.images.camera{1,2,3}`` names that your Stage-1 base policy
-# expects. Defaults match the standard benchmarks:
-#   LIBERO    → 2 cams (agentview=image, eye-in-hand=image2)
-#   METAWORLD → 1 cam  (top=image)
-#   ROBOTWIN  → 3 cams (head_camera, left_camera, right_camera)
 RENAME_MAP="${RENAME_MAP:-}"
 LIBERO_RENAME_MAP="${LIBERO_RENAME_MAP:-${RENAME_MAP:-{\"observation.images.image\":\"observation.images.camera1\",\"observation.images.image2\":\"observation.images.camera2\"}}}"
 METAWORLD_RENAME_MAP="${METAWORLD_RENAME_MAP:-${RENAME_MAP:-{\"observation.image\":\"observation.images.camera1\"}}}"
 ROBOTWIN_RENAME_MAP="${ROBOTWIN_RENAME_MAP:-${RENAME_MAP:-{\"observation.images.head_camera\":\"observation.images.camera1\",\"observation.images.left_camera\":\"observation.images.camera2\",\"observation.images.right_camera\":\"observation.images.camera3\"}}}"
 
-# Number of "empty" (zero-padded) cameras the policy should add to fill in the
-# remaining camera slots not provided by this benchmark. Stage-1 base was
-# trained with 3 cameras (camera1/2/3); benchmarks with fewer cameras need
-# the rest padded out at runtime.
-LIBERO_EMPTY_CAMERAS="${LIBERO_EMPTY_CAMERAS:-1}"     # 2 real + 1 empty = 3
-METAWORLD_EMPTY_CAMERAS="${METAWORLD_EMPTY_CAMERAS:-2}"  # 1 real + 2 empty = 3
-ROBOTWIN_EMPTY_CAMERAS="${ROBOTWIN_EMPTY_CAMERAS:-0}"   # 3 real + 0 empty = 3
+LIBERO_EMPTY_CAMERAS="${LIBERO_EMPTY_CAMERAS:-1}"
+METAWORLD_EMPTY_CAMERAS="${METAWORLD_EMPTY_CAMERAS:-2}"
+ROBOTWIN_EMPTY_CAMERAS="${ROBOTWIN_EMPTY_CAMERAS:-0}"
 
 LIBERO_DATASET="${LIBERO_DATASET:-HuggingFaceVLA/libero}"
 METAWORLD_DATASET="${METAWORLD_DATASET:-lerobot/metaworld_mt50}"
