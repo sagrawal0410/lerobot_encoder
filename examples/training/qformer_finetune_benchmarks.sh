@@ -131,15 +131,24 @@ ROBOTWIN_EVAL_N_EPISODES_TRAIN="${ROBOTWIN_EVAL_N_EPISODES_TRAIN:-${EVAL_N_EPISO
 # Frame-timestamp tolerance — same reasoning as Stage 1 (aggregator drift).
 TOLERANCE_S="${TOLERANCE_S:-0.001}"
 
-# Optional camera rename map. Stage-1 → Stage-2 normally needs no rename
-# because both LIBERO/MetaWorld/RoboTwin and the Stage-1 saved policy use
-# ``observation.images.camera{1,2,3}``. Override per-benchmark via
-# ``LIBERO_RENAME_MAP``, ``METAWORLD_RENAME_MAP``, ``ROBOTWIN_RENAME_MAP`` if
-# the benchmark dataset uses different camera keys.
+# Camera rename map: maps the benchmark dataset/env image keys onto the
+# ``observation.images.camera{1,2,3}`` names that your Stage-1 base policy
+# expects. Defaults match the standard benchmarks:
+#   LIBERO    → 2 cams (agentview=image, eye-in-hand=image2)
+#   METAWORLD → 1 cam  (top=image)
+#   ROBOTWIN  → 3 cams (head_camera, left_camera, right_camera)
 RENAME_MAP="${RENAME_MAP:-}"
-LIBERO_RENAME_MAP="${LIBERO_RENAME_MAP:-${RENAME_MAP}}"
-METAWORLD_RENAME_MAP="${METAWORLD_RENAME_MAP:-${RENAME_MAP}}"
-ROBOTWIN_RENAME_MAP="${ROBOTWIN_RENAME_MAP:-${RENAME_MAP}}"
+LIBERO_RENAME_MAP="${LIBERO_RENAME_MAP:-${RENAME_MAP:-{\"observation.images.image\":\"observation.images.camera1\",\"observation.images.image2\":\"observation.images.camera2\"}}}"
+METAWORLD_RENAME_MAP="${METAWORLD_RENAME_MAP:-${RENAME_MAP:-{\"observation.image\":\"observation.images.camera1\"}}}"
+ROBOTWIN_RENAME_MAP="${ROBOTWIN_RENAME_MAP:-${RENAME_MAP:-{\"observation.images.head_camera\":\"observation.images.camera1\",\"observation.images.left_camera\":\"observation.images.camera2\",\"observation.images.right_camera\":\"observation.images.camera3\"}}}"
+
+# Number of "empty" (zero-padded) cameras the policy should add to fill in the
+# remaining camera slots not provided by this benchmark. Stage-1 base was
+# trained with 3 cameras (camera1/2/3); benchmarks with fewer cameras need
+# the rest padded out at runtime.
+LIBERO_EMPTY_CAMERAS="${LIBERO_EMPTY_CAMERAS:-1}"     # 2 real + 1 empty = 3
+METAWORLD_EMPTY_CAMERAS="${METAWORLD_EMPTY_CAMERAS:-2}"  # 1 real + 2 empty = 3
+ROBOTWIN_EMPTY_CAMERAS="${ROBOTWIN_EMPTY_CAMERAS:-0}"   # 3 real + 0 empty = 3
 
 LIBERO_DATASET="${LIBERO_DATASET:-HuggingFaceVLA/libero}"
 METAWORLD_DATASET="${METAWORLD_DATASET:-lerobot/metaworld_mt50}"
@@ -205,6 +214,7 @@ resolve_benchmark_config() {
       BENCH_DATASET="${LIBERO_DATASET}"
       BENCH_EVAL_TASKS="${LIBERO_EVAL_TASKS}"
       BENCH_RENAME_MAP="${LIBERO_RENAME_MAP}"
+      BENCH_EMPTY_CAMERAS="${LIBERO_EMPTY_CAMERAS}"
       BENCH_STEPS="${LIBERO_STEPS}"
       BENCH_BATCH_SIZE="${LIBERO_BATCH_SIZE}"
       BENCH_EVAL_FREQ="${LIBERO_EVAL_FREQ}"
@@ -214,6 +224,7 @@ resolve_benchmark_config() {
       BENCH_DATASET="${METAWORLD_DATASET}"
       BENCH_EVAL_TASKS="${METAWORLD_EVAL_TASKS}"
       BENCH_RENAME_MAP="${METAWORLD_RENAME_MAP}"
+      BENCH_EMPTY_CAMERAS="${METAWORLD_EMPTY_CAMERAS}"
       BENCH_STEPS="${METAWORLD_STEPS}"
       BENCH_BATCH_SIZE="${METAWORLD_BATCH_SIZE}"
       BENCH_EVAL_FREQ="${METAWORLD_EVAL_FREQ}"
@@ -223,6 +234,7 @@ resolve_benchmark_config() {
       BENCH_DATASET="${ROBOTWIN_DATASET}"
       BENCH_EVAL_TASKS="${ROBOTWIN_EVAL_TASKS}"
       BENCH_RENAME_MAP="${ROBOTWIN_RENAME_MAP}"
+      BENCH_EMPTY_CAMERAS="${ROBOTWIN_EMPTY_CAMERAS}"
       BENCH_STEPS="${ROBOTWIN_STEPS}"
       BENCH_BATCH_SIZE="${ROBOTWIN_BATCH_SIZE}"
       BENCH_EVAL_FREQ="${ROBOTWIN_EVAL_FREQ}"
@@ -268,6 +280,7 @@ finetune_one() {
     --policy.train_expert_only="${TRAIN_EXPERT_ONLY}"
     --policy.optimizer_lr="${LR}"
     --policy.scheduler_decay_lr="${DECAY_LR}"
+    --policy.empty_cameras="${BENCH_EMPTY_CAMERAS}"
     --policy.repo_id="${repo_id}"
     --policy.push_to_hub="${PUSH_TO_HUB}"
     --dataset.repo_id="${BENCH_DATASET}"
@@ -314,13 +327,19 @@ final_eval_one() {
 
   echo ">>> [stage2-final-eval] ${run_name} (${EVAL_N_EPISODES_FINAL} episodes/task)" | tee -a "${SUMMARY_LOG}"
   mkdir -p "${eval_dir}"
-  run uv run lerobot-eval \
-    --policy.path="${checkpoint_dir}" \
-    --env.type="${bench}" \
-    --env.task="${BENCH_EVAL_TASKS}" \
-    --eval.batch_size=1 \
-    --eval.n_episodes="${EVAL_N_EPISODES_FINAL}" \
+  local eval_args=(
+    --policy.path="${checkpoint_dir}"
+    --policy.empty_cameras="${BENCH_EMPTY_CAMERAS}"
+    --env.type="${bench}"
+    --env.task="${BENCH_EVAL_TASKS}"
+    --eval.batch_size=1
+    --eval.n_episodes="${EVAL_N_EPISODES_FINAL}"
     --output_dir="${eval_dir}"
+  )
+  if [[ -n "${BENCH_RENAME_MAP}" && "${BENCH_RENAME_MAP}" != "{}" ]]; then
+    eval_args+=(--rename_map="${BENCH_RENAME_MAP}")
+  fi
+  run uv run lerobot-eval "${eval_args[@]}"
 
   echo ">>> [wandb-log] ${run_name}_final_eval" | tee -a "${SUMMARY_LOG}"
   run uv run python examples/training/log_eval_to_wandb.py \
