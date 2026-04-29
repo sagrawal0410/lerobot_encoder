@@ -1,3 +1,9 @@
+*Improved adaptive visual reasoning in smolVLA by adding a lightweight adapter between encoder and LLM to adaptively remove unnecessary context tokens for improved usage of context length across necessary patches
+
+
+
+
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>
